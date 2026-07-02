@@ -1,0 +1,12 @@
+runpod
+flask
+easyocr
+opencv-python-headless
+scikit-image
+rawpy
+imageio
+python-bidi
+pyclipper
+shapely
+numpy
+pillow
