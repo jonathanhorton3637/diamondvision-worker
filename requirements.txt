@@ -8,3 +8,4 @@ pyclipper
 shapely
 numpy
 pillow
+Dropbox
