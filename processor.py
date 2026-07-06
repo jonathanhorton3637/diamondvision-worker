@@ -1,14 +1,37 @@
 import os
+import json
 import cv2
 import csv
 import shutil
 import re
 from datetime import datetime
 
+
+PROCESSOR_VERSION = "DiamondVision Processor v2.0"
+
+
+def log(message):
+    print(f"[{PROCESSOR_VERSION}] {message}", flush=True)
+
+
 try:
     import rawpy
-except ImportError:
+    RAWPY_AVAILABLE = True
+    RAWPY_IMPORT_ERROR = ""
+    RAWPY_VERSION = getattr(rawpy, "__version__", "unknown")
+
+    log("rawpy successfully imported.")
+    log(f"rawpy version: {RAWPY_VERSION}")
+
+except Exception as e:
     rawpy = None
+    RAWPY_AVAILABLE = False
+    RAWPY_IMPORT_ERROR = str(e)
+    RAWPY_VERSION = ""
+
+    log("rawpy NOT available.")
+    log(f"rawpy import error: {RAWPY_IMPORT_ERROR}")
+
 
 try:
     import easyocr
@@ -16,24 +39,43 @@ except ImportError:
     easyocr = None
 
 
-SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".nef")
-DISPLAY_EXTENSIONS = (".jpg", ".jpeg", ".png")
+SUPPORTED_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".nef",
+)
+
+RAW_EXTENSIONS = (
+    ".nef",
+)
+
+DISPLAY_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+)
+
 ocr_reader = None
 
 
 def safe_name(text):
     text = str(text).strip() or "Unknown"
-    for ch in '<>:"/\\|?*':
+
+    for ch in '<>:"/\\|?*#':
         text = text.replace(ch, "_")
+
     return text.replace(" ", "_")
 
 
 def resize_for_speed(img, max_width=1200):
     h, w = img.shape[:2]
+
     if w <= max_width:
         return img
 
     scale = max_width / w
+
     return cv2.resize(
         img,
         (int(w * scale), int(h * scale)),
@@ -41,27 +83,69 @@ def resize_for_speed(img, max_width=1200):
     )
 
 
-def load_image_fast(path):
+def load_image_fast(path, raw_debug=None):
+    basename = os.path.basename(path)
     ext = os.path.splitext(path)[1].lower()
 
-    if ext == ".nef":
+    log(f"Loading image: {basename}")
+    log(f"Extension detected: {ext}")
+
+    if ext in RAW_EXTENSIONS:
+        if raw_debug is not None:
+            raw_debug["raw_seen"] += 1
+
+        log("Processing RAW/NEF file.")
+
         if rawpy is None:
+            log("rawpy unavailable. Cannot decode RAW/NEF.")
+
+            if raw_debug is not None:
+                raw_debug["raw_failed"] += 1
+                raw_debug["raw_failures"].append({
+                    "file": basename,
+                    "reason": f"rawpy unavailable: {RAWPY_IMPORT_ERROR}"
+                })
+
             return None
 
-        with rawpy.imread(path) as raw:
-            rgb = raw.postprocess(
-                use_camera_wb=True,
-                half_size=True,
-                no_auto_bright=True,
-                output_bps=8
-            )
+        try:
+            with rawpy.imread(path) as raw:
+                rgb = raw.postprocess(
+                    use_camera_wb=True,
+                    half_size=True,
+                    no_auto_bright=True,
+                    output_bps=8
+                )
+
             img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            return resize_for_speed(img)
+            img = resize_for_speed(img)
+
+            log(f"RAW/NEF decoded successfully: {basename}")
+
+            if raw_debug is not None:
+                raw_debug["raw_decoded"] += 1
+
+            return img
+
+        except Exception as e:
+            log(f"RAW/NEF decode failed for {basename}: {e}")
+
+            if raw_debug is not None:
+                raw_debug["raw_failed"] += 1
+                raw_debug["raw_failures"].append({
+                    "file": basename,
+                    "reason": str(e)
+                })
+
+            return None
 
     img = cv2.imread(path)
 
     if img is None:
+        log(f"cv2 failed to load image: {basename}")
         return None
+
+    log(f"Standard image loaded successfully: {basename}")
 
     return resize_for_speed(img)
 
@@ -76,7 +160,10 @@ def save_display_jpeg(original_path, img, output_folder):
         stamp = datetime.now().strftime("%H%M%S%f")
         destination = os.path.join(output_folder, f"{name}_{stamp}.jpg")
 
-    cv2.imwrite(destination, img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    ok = cv2.imwrite(destination, img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+
+    if not ok:
+        raise RuntimeError(f"Failed to write JPEG: {destination}")
 
     return destination
 
@@ -118,7 +205,11 @@ def contrast_score(img):
 def center_detail_score(img):
     h, w = img.shape[:2]
     center = img[int(h * .18):int(h * .82), int(w * .18):int(w * .82)]
-    return min((contrast_score(center) * .75) + (contrast_score(img) * .25), 100)
+
+    return min(
+        (contrast_score(center) * .75) + (contrast_score(img) * .25),
+        100
+    )
 
 
 def total_score(img):
@@ -134,14 +225,17 @@ def total_score(img):
 def classify(score):
     if score >= 70:
         return "Best"
+
     if score >= 38:
         return "Keep"
+
     return "Reject"
 
 
 def average_hash(img, hash_size=8):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     small = cv2.resize(gray, (hash_size, hash_size), interpolation=cv2.INTER_AREA)
+
     return (small > small.mean()).flatten()
 
 
@@ -183,10 +277,13 @@ def jersey_crops(img):
     ]
 
     good = []
+
     for name, crop in crops:
         if crop is None:
             continue
+
         ch, cw = crop.shape[:2]
+
         if ch >= 40 and cw >= 40:
             good.append((name, crop))
 
@@ -211,6 +308,7 @@ def preprocess_for_ocr(crop):
         31,
         8
     )
+
     versions.append(("adaptive", adaptive))
     versions.append(("adaptive_inv", cv2.bitwise_not(adaptive)))
 
@@ -220,12 +318,15 @@ def preprocess_for_ocr(crop):
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
+
     versions.append(("otsu", otsu))
     versions.append(("otsu_inv", cv2.bitwise_not(otsu)))
 
     upscaled = []
+
     for name, v in versions:
         h, w = v.shape[:2]
+
         upscaled.append((
             name,
             cv2.resize(v, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
@@ -267,11 +368,9 @@ def read_jersey_number(img):
 
                     adjusted_conf = conf
 
-                    # Softball rosters are usually 1–2 digit.
                     if len(digits) <= 2:
                         adjusted_conf += 0.05
 
-                    # Avoid crazy 3-digit false positives unless strong.
                     if len(digits) == 3 and conf < 0.55:
                         continue
 
@@ -305,6 +404,7 @@ def parse_roster_text(text):
 
         number = parts[0].replace("#", "")
         name = " ".join(parts[1:])
+
         roster[number] = name
 
     return roster
@@ -332,16 +432,11 @@ def summarize_results(results):
         "keep": len([r for r in results if r["Category"] == "Keep"]),
         "reject": len([r for r in results if r["Category"] == "Reject"]),
         "duplicates": len([r for r in results if r["Category"] == "Duplicates"]),
-        "matched": len([r for r in results if r["Assigned Player"] != "Unknown"])
+        "matched": len([r for r in results if r["Assigned Player"] != "Unknown"]),
     }
 
 
 def detect_team_from_color(img, team1_color="", team2_color=""):
-    """
-    Simple first-pass jersey color routing.
-    Looks at center torso crop and compares dominant HSV color to selected team colors.
-    If uncertain, defaults to Team 1.
-    """
     if not team1_color and not team2_color:
         return "Team_1"
 
@@ -349,6 +444,7 @@ def detect_team_from_color(img, team1_color="", team2_color=""):
     crop = img[int(h*.20):int(h*.80), int(w*.25):int(w*.75)]
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
     mean_h = hsv[:, :, 0].mean()
     mean_s = hsv[:, :, 1].mean()
     mean_v = hsv[:, :, 2].mean()
@@ -379,7 +475,6 @@ def detect_team_from_color(img, team1_color="", team2_color=""):
     return "Team_1"
 
 
-
 def roster_match_number(ocr_number, roster):
     if not ocr_number:
         return ""
@@ -387,13 +482,13 @@ def roster_match_number(ocr_number, roster):
     if ocr_number in roster:
         return ocr_number
 
-    # Common OCR issue: reads 8 when jersey is 88, 1 when jersey is 11, etc.
     doubled = ocr_number + ocr_number
+
     if doubled in roster:
         return doubled
 
-    # Common OCR issue: drops leading/trailing digit.
     possible = []
+
     for number in roster.keys():
         if ocr_number in number or number in ocr_number:
             possible.append(number)
@@ -403,40 +498,42 @@ def roster_match_number(ocr_number, roster):
 
     return ""
 
-def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=None):
-    """
-    Supports both original single-team mode and new two-team mode.
 
-    Original call:
-        process_mobile_job(input_dir, output_dir, roster_text)
-
-    New call from app.py:
-        process_mobile_job(input_dir, output_dir, job_config)
-
-    job_config:
-        {
-            "mode": "single" or "two_team",
-            "team1": "...",
-            "team1_color": "white",
-            "roster1": "...",
-            "team2": "...",
-            "team2_color": "blue",
-            "roster2": "..."
-        }
-    """
-
+def build_job_config(roster_text):
     if isinstance(roster_text, dict):
-        job_config = roster_text
-    else:
-        job_config = {
-            "mode": "single",
-            "team1": "Team",
-            "team1_color": "",
-            "roster1": roster_text,
-            "team2": "Opponent",
-            "team2_color": "",
-            "roster2": ""
-        }
+        return roster_text
+
+    return {
+        "mode": "single",
+        "team1": "Team",
+        "team1_color": "",
+        "roster1": roster_text,
+        "team2": "Opponent",
+        "team2_color": "",
+        "roster2": ""
+    }
+
+
+def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=None):
+    log("=" * 60)
+    log("Starting process_mobile_job.")
+    log(f"rawpy_available={RAWPY_AVAILABLE}")
+    log(f"rawpy_version={RAWPY_VERSION}")
+
+    if RAWPY_IMPORT_ERROR:
+        log(f"rawpy_import_error={RAWPY_IMPORT_ERROR}")
+
+    raw_debug = {
+        "rawpy_available": RAWPY_AVAILABLE,
+        "rawpy_version": RAWPY_VERSION,
+        "rawpy_import_error": RAWPY_IMPORT_ERROR,
+        "raw_seen": 0,
+        "raw_decoded": 0,
+        "raw_failed": 0,
+        "raw_failures": [],
+    }
+
+    job_config = build_job_config(roster_text)
 
     mode = job_config.get("mode", "single")
 
@@ -462,7 +559,7 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
         "Players",
         "Players/Unknown",
         "Favorites",
-        "Reports"
+        "Reports",
     ]
 
     for folder in base_folders:
@@ -486,24 +583,29 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
     files = find_images(input_dir)
     total = len(files)
 
+    log(f"Found {total} supported image(s).")
+
     if progress_callback:
         progress_callback(0, total, "Starting DiamondVision...")
 
     for index, file in enumerate(files, start=1):
         basename = os.path.basename(file)
 
+        log("-" * 60)
+        log(f"Processing {index}/{total}: {basename}")
+
         if progress_callback:
             progress_callback(index - 1, total, f"Loading {basename}")
 
         original_path = copy_unique(file, os.path.join(output_dir, "Originals"))
 
-        img = load_image_fast(file)
+        img = load_image_fast(file, raw_debug=raw_debug)
 
         if img is None:
-            sorted_path = copy_unique(file, os.path.join(output_dir, "Reject"))
+            log(f"Image failed to load/decode. Marking reject: {basename}")
 
             results.append({
-                "Original File": file,
+                "Original File": original_path,
                 "Category": "Reject",
                 "Score": 0,
                 "Duplicate": "No",
@@ -512,13 +614,15 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
                 "OCR Raw": "",
                 "Assigned Player": "Unknown",
                 "Assigned Team": "Unknown",
-                "Sorted Path": sorted_path,
+                "Sorted Path": "",
                 "Player Path": ""
             })
 
+            if progress_callback:
+                progress_callback(index, total, f"Rejected unreadable file: {basename}")
+
             continue
 
-        assigned_team_key = "Team_1"
         assigned_team_name = team1_name
         active_roster = roster1
 
@@ -528,15 +632,16 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
             if assigned_team_key == "Team_2":
                 assigned_team_name = team2_name
                 active_roster = roster2
-            else:
-                assigned_team_name = team1_name
-                active_roster = roster1
 
         img_hash = average_hash(img)
         duplicate = any(hamming_distance(img_hash, h) <= 3 for h in hashes)
 
         if duplicate:
-            display_path = save_display_jpeg(file, img, os.path.join(output_dir, "Duplicates"))
+            display_path = save_display_jpeg(
+                file,
+                img,
+                os.path.join(output_dir, "Duplicates")
+            )
 
             results.append({
                 "Original File": original_path,
@@ -552,6 +657,8 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
                 "Player Path": ""
             })
 
+            log(f"Duplicate detected: {basename}")
+
             if progress_callback:
                 progress_callback(index, total, f"Duplicate: {basename}")
 
@@ -562,7 +669,11 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
         score = total_score(img)
         category = classify(score)
 
-        display_path = save_display_jpeg(file, img, os.path.join(output_dir, category))
+        display_path = save_display_jpeg(
+            file,
+            img,
+            os.path.join(output_dir, category)
+        )
 
         if mode == "two_team":
             save_display_jpeg(
@@ -631,13 +742,17 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
             "Player Path": player_path
         })
 
+        log(f"Finished {basename}: category={category}, score={round(score, 2)}")
+
         if progress_callback:
             progress_callback(index, total, f"{category}: {basename}")
 
     best = sorted(
         [
             r for r in results
-            if r["Category"] in ("Best", "Keep") and r["Duplicate"] == "No"
+            if r["Category"] in ("Best", "Keep")
+            and r["Duplicate"] == "No"
+            and r.get("Sorted Path")
         ],
         key=lambda x: x["Score"],
         reverse=True
@@ -646,12 +761,12 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
     for r in best[:75]:
         try:
             copy_unique(r["Sorted Path"], os.path.join(output_dir, "BestOfTournament"))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"BestOfTournament copy failed: {e}")
 
     report = os.path.join(output_dir, "Reports", "diamondvision_report.csv")
 
-    with open(report, "w", newline="") as f:
+    with open(report, "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "Original File",
             "Category",
@@ -670,9 +785,69 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
         w.writeheader()
         w.writerows(results)
 
+    metadata_images = []
+
+    for r in results:
+        filename = os.path.basename(r.get("Sorted Path") or r.get("Original File") or "")
+
+        ocr_conf = float(r.get("OCR Confidence") or 0)
+        score = float(r.get("Score") or 0)
+        duplicate = r.get("Duplicate") == "Yes"
+        category = r.get("Category", "")
+        assigned_player = r.get("Assigned Player", "Unknown") or "Unknown"
+
+        needs_review = (
+            assigned_player == "Unknown"
+            or ocr_conf < 0.50
+            or category == "Reject"
+        )
+
+        ai_confidence = int(max(
+            0,
+            min(100, round(((ocr_conf * 100) * 0.65) + (score * 0.35)))
+        ))
+
+        metadata_images.append({
+            "id": os.path.splitext(filename)[0],
+            "filename": filename,
+            "player": assigned_player,
+            "team": r.get("Assigned Team", "Unknown"),
+            "category": category,
+            "score": score,
+            "ocr": r.get("OCR Number", ""),
+            "ocr_confidence": round(ocr_conf * 100, 1),
+            "ocr_raw": r.get("OCR Raw", ""),
+            "duplicate": duplicate,
+            "favorite": False,
+            "needs_review": needs_review,
+            "ai_confidence": ai_confidence,
+            "original_path": r.get("Original File", ""),
+            "sorted_path": r.get("Sorted Path", ""),
+            "player_path": r.get("Player Path", "")
+        })
+
     summary = summarize_results(results)
+
+    metadata = {
+        "version": "4.1",
+        "processor_version": PROCESSOR_VERSION,
+        "summary": summary,
+        "raw_support": raw_debug,
+        "images": metadata_images
+    }
+
+    metadata_path = os.path.join(output_dir, "Reports", "metadata.json")
+
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     if progress_callback:
         progress_callback(total, total, "Complete")
+
+    log("=" * 60)
+    log("process_mobile_job complete.")
+    log(f"Summary: {summary}")
+    log(f"RAW support: {raw_debug}")
+    log("=" * 60)
 
     return summary
