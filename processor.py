@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 
 
-PROCESSOR_VERSION = "DiamondVision Processor v2.0"
+PROCESSOR_VERSION = "DiamondVision Processor v2.1 OCR"
 
 
 def log(message):
@@ -19,16 +19,13 @@ try:
     RAWPY_AVAILABLE = True
     RAWPY_IMPORT_ERROR = ""
     RAWPY_VERSION = getattr(rawpy, "__version__", "unknown")
-
     log("rawpy successfully imported.")
     log(f"rawpy version: {RAWPY_VERSION}")
-
 except Exception as e:
     rawpy = None
     RAWPY_AVAILABLE = False
     RAWPY_IMPORT_ERROR = str(e)
     RAWPY_VERSION = ""
-
     log("rawpy NOT available.")
     log(f"rawpy import error: {RAWPY_IMPORT_ERROR}")
 
@@ -39,43 +36,25 @@ except ImportError:
     easyocr = None
 
 
-SUPPORTED_EXTENSIONS = (
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".nef",
-)
-
-RAW_EXTENSIONS = (
-    ".nef",
-)
-
-DISPLAY_EXTENSIONS = (
-    ".jpg",
-    ".jpeg",
-    ".png",
-)
-
+SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".nef")
+RAW_EXTENSIONS = (".nef",)
+DISPLAY_EXTENSIONS = (".jpg", ".jpeg", ".png")
 ocr_reader = None
 
 
 def safe_name(text):
     text = str(text).strip() or "Unknown"
-
     for ch in '<>:"/\\|?*#':
         text = text.replace(ch, "_")
-
     return text.replace(" ", "_")
 
 
-def resize_for_speed(img, max_width=1200):
+def resize_for_speed(img, max_width=1400):
     h, w = img.shape[:2]
-
     if w <= max_width:
         return img
 
     scale = max_width / w
-
     return cv2.resize(
         img,
         (int(w * scale), int(h * scale)),
@@ -94,16 +73,15 @@ def load_image_fast(path, raw_debug=None):
         if raw_debug is not None:
             raw_debug["raw_seen"] += 1
 
-        log("Processing RAW/NEF file.")
-
         if rawpy is None:
-            log("rawpy unavailable. Cannot decode RAW/NEF.")
+            reason = f"rawpy unavailable: {RAWPY_IMPORT_ERROR}"
+            log(reason)
 
             if raw_debug is not None:
                 raw_debug["raw_failed"] += 1
                 raw_debug["raw_failures"].append({
                     "file": basename,
-                    "reason": f"rawpy unavailable: {RAWPY_IMPORT_ERROR}"
+                    "reason": reason
                 })
 
             return None
@@ -144,8 +122,6 @@ def load_image_fast(path, raw_debug=None):
     if img is None:
         log(f"cv2 failed to load image: {basename}")
         return None
-
-    log(f"Standard image loaded successfully: {basename}")
 
     return resize_for_speed(img)
 
@@ -235,7 +211,6 @@ def classify(score):
 def average_hash(img, hash_size=8):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     small = cv2.resize(gray, (hash_size, hash_size), interpolation=cv2.INTER_AREA)
-
     return (small > small.mean()).flatten()
 
 
@@ -247,6 +222,7 @@ def init_ocr():
     global ocr_reader
 
     if easyocr is None:
+        log("easyocr is not available.")
         return None
 
     if ocr_reader is None:
@@ -258,6 +234,7 @@ def init_ocr():
         except Exception:
             gpu_enabled = False
 
+        log(f"Initializing EasyOCR. GPU={gpu_enabled}")
         ocr_reader = easyocr.Reader(["en"], gpu=gpu_enabled)
 
     return ocr_reader
@@ -267,13 +244,17 @@ def jersey_crops(img):
     h, w = img.shape[:2]
 
     crops = [
-        ("full_center", img[int(h*.08):int(h*.92), int(w*.12):int(w*.88)]),
-        ("torso_center", img[int(h*.18):int(h*.82), int(w*.18):int(w*.82)]),
-        ("chest_center", img[int(h*.20):int(h*.68), int(w*.25):int(w*.75)]),
-        ("upper_wide", img[int(h*.05):int(h*.72), int(w*.08):int(w*.92)]),
-        ("lower_torso", img[int(h*.35):int(h*.92), int(w*.18):int(w*.82)]),
-        ("left_body", img[int(h*.12):int(h*.86), int(w*.03):int(w*.58)]),
-        ("right_body", img[int(h*.12):int(h*.86), int(w*.42):int(w*.97)]),
+        ("full", img),
+        ("full_center", img[int(h*.05):int(h*.95), int(w*.08):int(w*.92)]),
+        ("torso_center", img[int(h*.15):int(h*.88), int(w*.15):int(w*.85)]),
+        ("chest_center", img[int(h*.18):int(h*.70), int(w*.22):int(w*.78)]),
+        ("upper_wide", img[int(h*.05):int(h*.76), int(w*.05):int(w*.95)]),
+        ("middle_wide", img[int(h*.20):int(h*.82), int(w*.05):int(w*.95)]),
+        ("lower_torso", img[int(h*.32):int(h*.95), int(w*.15):int(w*.85)]),
+        ("left_body", img[int(h*.08):int(h*.90), int(w*.00):int(w*.62)]),
+        ("right_body", img[int(h*.08):int(h*.90), int(w*.38):int(w*1.00)]),
+        ("center_tall", img[int(h*.00):int(h*1.00), int(w*.25):int(w*.75)]),
+        ("center_square", img[int(h*.18):int(h*.82), int(w*.20):int(w*.80)]),
     ]
 
     good = []
@@ -294,6 +275,8 @@ def preprocess_for_ocr(crop):
     versions = []
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    versions.append(("gray", gray))
 
     eq = cv2.equalizeHist(gray)
     versions.append(("equalized", eq))
@@ -322,27 +305,54 @@ def preprocess_for_ocr(crop):
     versions.append(("otsu", otsu))
     versions.append(("otsu_inv", cv2.bitwise_not(otsu)))
 
+    high_contrast = cv2.convertScaleAbs(gray, alpha=1.8, beta=10)
+    versions.append(("high_contrast", high_contrast))
+
     upscaled = []
 
     for name, v in versions:
         h, w = v.shape[:2]
 
-        upscaled.append((
-            name,
-            cv2.resize(v, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-        ))
+        if h < 900 and w < 900:
+            upscaled.append((
+                name + "_2x",
+                cv2.resize(v, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            ))
+
+        upscaled.append((name, v))
 
     return upscaled
+
+
+def clean_ocr_digits(text):
+    text = str(text or "").upper()
+
+    replacements = {
+        "O": "0",
+        "Q": "0",
+        "D": "0",
+        "I": "1",
+        "L": "1",
+        "|": "1",
+        "S": "5",
+        "B": "8",
+        "G": "6",
+        "Z": "2",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return re.sub(r"\D", "", text)
 
 
 def read_jersey_number(img):
     reader = init_ocr()
 
     if reader is None:
-        return "", 0.0, ""
+        return "", 0.0, "OCR_DISABLED"
 
-    best_number = ""
-    best_conf = 0.0
+    candidates = []
     raw_hits = []
 
     try:
@@ -352,13 +362,13 @@ def read_jersey_number(img):
                     processed,
                     detail=1,
                     paragraph=False,
-                    allowlist="0123456789"
+                    allowlist="0123456789#OQDISBLZG|"
                 )
 
                 for item in found:
                     text = str(item[1])
                     conf = float(item[2])
-                    digits = re.sub(r"\D", "", text)
+                    digits = clean_ocr_digits(text)
 
                     if not digits:
                         continue
@@ -369,45 +379,165 @@ def read_jersey_number(img):
                     adjusted_conf = conf
 
                     if len(digits) <= 2:
-                        adjusted_conf += 0.05
+                        adjusted_conf += 0.08
 
-                    if len(digits) == 3 and conf < 0.55:
+                    if len(digits) == 3 and conf < 0.45:
                         continue
 
                     raw_hits.append(
-                        f"{crop_name}/{version_name}:{digits}:{conf:.2f}"
+                        f"{crop_name}/{version_name}:{text}->{digits}:{conf:.2f}"
                     )
 
-                    if adjusted_conf > best_conf:
-                        best_number = digits
-                        best_conf = adjusted_conf
+                    candidates.append({
+                        "digits": digits,
+                        "confidence": min(adjusted_conf, 1.0),
+                        "raw_confidence": conf,
+                        "source": f"{crop_name}/{version_name}",
+                        "text": text
+                    })
 
-        return best_number, min(best_conf, 1.0), " | ".join(raw_hits)
+        if not candidates:
+            return "", 0.0, ""
+
+        candidates = sorted(
+            candidates,
+            key=lambda x: x["confidence"],
+            reverse=True
+        )
+
+        best = candidates[0]
+
+        return (
+            best["digits"],
+            min(best["confidence"], 1.0),
+            " | ".join(raw_hits)
+        )
 
     except Exception as e:
         return "", 0.0, f"OCR_ERROR:{e}"
 
 
 def parse_roster_text(text):
+    """
+    Accepts:
+    12 John Smith
+    John Smith 12
+    #12 John Smith
+    John Smith #12
+    12, John Smith
+    John Smith, 12
+    12 - John Smith
+    John Smith - 12
+    12: John Smith
+    John Smith: 12
+    """
+
     roster = {}
 
-    for line in text.splitlines():
-        line = line.strip()
+    for line in str(text or "").splitlines():
+        original = line.strip()
 
-        if not line:
+        if not original:
             continue
 
-        parts = line.split()
+        line = original.replace("\t", " ")
+        line = re.sub(r"\s+", " ", line).strip()
 
-        if len(parts) < 2:
+        number = ""
+        name = ""
+
+        parts = [
+            p.strip()
+            for p in re.split(r"\s*[,:\-–—|]\s*", line)
+            if p.strip()
+        ]
+
+        if len(parts) >= 2:
+            first = parts[0]
+            last = parts[-1]
+
+            first_num = re.fullmatch(r"#?\d{1,3}", first)
+            last_num = re.fullmatch(r"#?\d{1,3}", last)
+
+            if first_num:
+                number = first.replace("#", "")
+                name = " ".join(parts[1:]).strip()
+
+            elif last_num:
+                number = last.replace("#", "")
+                name = " ".join(parts[:-1]).strip()
+
+        if not number:
+            m = re.match(r"^#?(\d{1,3})\s+(.+)$", line)
+            if m:
+                number = m.group(1)
+                name = m.group(2).strip()
+
+        if not number:
+            m = re.match(r"^(.+?)\s+#?(\d{1,3})$", line)
+            if m:
+                name = m.group(1).strip()
+                number = m.group(2)
+
+        if not number or not name:
+            log(f"Roster line skipped: {original}")
             continue
 
-        number = parts[0].replace("#", "")
-        name = " ".join(parts[1:])
+        name = re.sub(r"\s+", " ", name).strip(" ,:-–—|")
+        number = number.strip().replace("#", "")
+
+        if not number.isdigit():
+            log(f"Roster line skipped, invalid number: {original}")
+            continue
 
         roster[number] = name
 
+    log(f"Roster parsed: {len(roster)} players")
     return roster
+
+
+def roster_match_number(ocr_number, roster, ocr_conf=0.0, ocr_raw=""):
+    if not roster:
+        return "", "no_roster"
+
+    ocr_number = clean_ocr_digits(ocr_number)
+    raw_digits = clean_ocr_digits(ocr_raw)
+
+    if not ocr_number and not raw_digits:
+        return "", "no_ocr_number"
+
+    if ocr_number in roster:
+        return ocr_number, "exact"
+
+    if raw_digits:
+        for number in roster.keys():
+            if number in raw_digits:
+                return number, "raw_contains_roster_number"
+
+    if ocr_number:
+        doubled = ocr_number + ocr_number
+        if doubled in roster:
+            return doubled, "doubled_digit"
+
+    possible = []
+
+    for number in roster.keys():
+        if ocr_number and (ocr_number in number or number in ocr_number):
+            possible.append(number)
+
+    if len(possible) == 1:
+        return possible[0], "partial_unique"
+
+    if len(possible) > 1:
+        possible_sorted = sorted(possible, key=lambda x: abs(len(x) - len(ocr_number)))
+        return possible_sorted[0], "partial_best_guess"
+
+    if len(ocr_number) == 1:
+        ending = [n for n in roster.keys() if n.endswith(ocr_number)]
+        if len(ending) == 1:
+            return ending[0], "single_digit_suffix_unique"
+
+    return "", "no_match"
 
 
 def copy_unique(src, folder):
@@ -475,30 +605,6 @@ def detect_team_from_color(img, team1_color="", team2_color=""):
     return "Team_1"
 
 
-def roster_match_number(ocr_number, roster):
-    if not ocr_number:
-        return ""
-
-    if ocr_number in roster:
-        return ocr_number
-
-    doubled = ocr_number + ocr_number
-
-    if doubled in roster:
-        return doubled
-
-    possible = []
-
-    for number in roster.keys():
-        if ocr_number in number or number in ocr_number:
-            possible.append(number)
-
-    if len(possible) == 1:
-        return possible[0]
-
-    return ""
-
-
 def build_job_config(roster_text):
     if isinstance(roster_text, dict):
         return roster_text
@@ -519,9 +625,6 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
     log("Starting process_mobile_job.")
     log(f"rawpy_available={RAWPY_AVAILABLE}")
     log(f"rawpy_version={RAWPY_VERSION}")
-
-    if RAWPY_IMPORT_ERROR:
-        log(f"rawpy_import_error={RAWPY_IMPORT_ERROR}")
 
     raw_debug = {
         "rawpy_available": RAWPY_AVAILABLE,
@@ -598,12 +701,9 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
             progress_callback(index - 1, total, f"Loading {basename}")
 
         original_path = copy_unique(file, os.path.join(output_dir, "Originals"))
-
         img = load_image_fast(file, raw_debug=raw_debug)
 
         if img is None:
-            log(f"Image failed to load/decode. Marking reject: {basename}")
-
             results.append({
                 "Original File": original_path,
                 "Category": "Reject",
@@ -612,6 +712,7 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
                 "OCR Number": "",
                 "OCR Confidence": 0,
                 "OCR Raw": "",
+                "OCR Match Method": "decode_failed",
                 "Assigned Player": "Unknown",
                 "Assigned Team": "Unknown",
                 "Sorted Path": "",
@@ -651,13 +752,12 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
                 "OCR Number": "",
                 "OCR Confidence": 0,
                 "OCR Raw": "",
+                "OCR Match Method": "duplicate_skipped",
                 "Assigned Player": "Unknown",
                 "Assigned Team": assigned_team_name,
                 "Sorted Path": display_path,
                 "Player Path": ""
             })
-
-            log(f"Duplicate detected: {basename}")
 
             if progress_callback:
                 progress_callback(index, total, f"Duplicate: {basename}")
@@ -685,18 +785,23 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
         ocr_number = ""
         ocr_conf = 0
         ocr_raw = ""
+        match_method = ""
         assigned = "Unknown"
         player_path = ""
 
-        if category in ("Best", "Keep"):
-            ocr_number, ocr_conf, ocr_raw = read_jersey_number(img)
+        ocr_number, ocr_conf, ocr_raw = read_jersey_number(img)
+        matched_number, match_method = roster_match_number(
+            ocr_number,
+            active_roster,
+            ocr_conf=ocr_conf,
+            ocr_raw=ocr_raw
+        )
 
-            matched_number = roster_match_number(ocr_number, active_roster)
+        if matched_number:
+            ocr_number = matched_number
+            assigned = active_roster[matched_number]
 
-            if matched_number and ocr_conf >= .25:
-                ocr_number = matched_number
-                assigned = active_roster[matched_number]
-
+        if category in ("Best", "Keep") or assigned != "Unknown":
             if assigned == "Unknown":
                 player_folder = os.path.join(output_dir, "Players", "Unknown")
             else:
@@ -736,13 +841,18 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
             "OCR Number": ocr_number,
             "OCR Confidence": round(ocr_conf, 3),
             "OCR Raw": ocr_raw,
+            "OCR Match Method": match_method,
             "Assigned Player": assigned,
             "Assigned Team": assigned_team_name,
             "Sorted Path": display_path,
             "Player Path": player_path
         })
 
-        log(f"Finished {basename}: category={category}, score={round(score, 2)}")
+        log(
+            f"Finished {basename}: category={category}, score={round(score, 2)}, "
+            f"ocr={ocr_number}, conf={round(ocr_conf, 3)}, "
+            f"match={match_method}, player={assigned}"
+        )
 
         if progress_callback:
             progress_callback(index, total, f"{category}: {basename}")
@@ -775,6 +885,7 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
             "OCR Number",
             "OCR Confidence",
             "OCR Raw",
+            "OCR Match Method",
             "Assigned Player",
             "Assigned Team",
             "Sorted Path",
@@ -798,7 +909,7 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
 
         needs_review = (
             assigned_player == "Unknown"
-            or ocr_conf < 0.50
+            or ocr_conf < 0.35
             or category == "Reject"
         )
 
@@ -817,6 +928,7 @@ def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=
             "ocr": r.get("OCR Number", ""),
             "ocr_confidence": round(ocr_conf * 100, 1),
             "ocr_raw": r.get("OCR Raw", ""),
+            "ocr_match_method": r.get("OCR Match Method", ""),
             "duplicate": duplicate,
             "favorite": False,
             "needs_review": needs_review,
