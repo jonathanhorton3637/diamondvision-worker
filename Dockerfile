@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -28,8 +28,10 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN python3 -m pip install --upgrade pip setuptools wheel \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.3.1 torchvision==0.18.1 \
+    && python3 -m pip install \
+        torch==2.9.1 \
+        torchvision==0.24.1 \
+        --index-url https://download.pytorch.org/whl/cu128 \
     && python3 -m pip install -r requirements.txt
 
 COPY . .
@@ -37,8 +39,19 @@ COPY . .
 RUN mkdir -p /models/easyocr /models/torch \
     && python3 -m compileall -q /app \
     && python3 - <<'PY'
+import torch
 import easyocr
-easyocr.Reader(["en"], gpu=False, verbose=False)
+
+print("Torch version:", torch.__version__)
+print("Torch CUDA runtime:", torch.version.cuda)
+print("CUDA available during build:", torch.cuda.is_available())
+
+easyocr.Reader(
+    ["en"],
+    gpu=False,
+    verbose=False,
+)
+
 print("EasyOCR model cache initialized.")
 PY
 
