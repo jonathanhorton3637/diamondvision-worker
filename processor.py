@@ -1,638 +1,965 @@
-"""Core DiamondVision image-processing pipeline.
-
-This module intentionally contains no Dropbox, RunPod, ZIP, or temporary-directory code.
-"""
-
-from __future__ import annotations
-
-import csv
-from dataclasses import asdict, is_dataclass
-import json
-import logging
 import os
-from pathlib import Path
-import re
-from typing import Any, Callable, Mapping
-
+import json
 import cv2
-import numpy as np
-
-from duplicates import DuplicateDetector
-from image_utils import copy_unique, find_images, save_display_jpeg
-from ocr import match_roster_number, parse_roster_text, read_jersey_number
-import scoring
-
-LOGGER = logging.getLogger(__name__)
-ProgressCallback = Callable[[int, int, str], None]
+import csv
+import shutil
+import re
+from datetime import datetime
 
 
-def safe_name(value: object) -> str:
-    """Return a filesystem-safe folder component."""
-    text = re.sub(r"\s+", "_", str(value or "").strip()) or "Unknown"
-    text = re.sub(r'[<>:"/\\|?*#\x00-\x1f]', "_", text)
-    text = re.sub(r"_+", "_", text)
-    return text.strip(" ._") or "Unknown"
+PROCESSOR_VERSION = "DiamondVision Processor v2.1 OCR"
 
 
-def _load_image(path: str) -> np.ndarray | None:
-    """Call the image loader exposed by image_utils.py."""
-    import image_utils
+def log(message):
+    print(f"[{PROCESSOR_VERSION}] {message}", flush=True)
 
-    for name in ("load_image", "load_image_fast", "load"):
-        loader = getattr(image_utils, name, None)
-        if callable(loader):
-            return loader(path)
 
-    raise AttributeError(
-        "image_utils.py must expose load_image(path) or load_image_fast(path)."
+try:
+    import rawpy
+    RAWPY_AVAILABLE = True
+    RAWPY_IMPORT_ERROR = ""
+    RAWPY_VERSION = getattr(rawpy, "__version__", "unknown")
+    log("rawpy successfully imported.")
+    log(f"rawpy version: {RAWPY_VERSION}")
+except Exception as e:
+    rawpy = None
+    RAWPY_AVAILABLE = False
+    RAWPY_IMPORT_ERROR = str(e)
+    RAWPY_VERSION = ""
+    log("rawpy NOT available.")
+    log(f"rawpy import error: {RAWPY_IMPORT_ERROR}")
+
+
+try:
+    import easyocr
+except ImportError:
+    easyocr = None
+
+
+SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".nef")
+RAW_EXTENSIONS = (".nef",)
+DISPLAY_EXTENSIONS = (".jpg", ".jpeg", ".png")
+ocr_reader = None
+
+
+def safe_name(text):
+    text = str(text).strip() or "Unknown"
+    for ch in '<>:"/\\|?*#':
+        text = text.replace(ch, "_")
+    return text.replace(" ", "_")
+
+
+def resize_for_speed(img, max_width=1400):
+    h, w = img.shape[:2]
+    if w <= max_width:
+        return img
+
+    scale = max_width / w
+    return cv2.resize(
+        img,
+        (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_AREA
     )
 
 
-def _score_image(image: np.ndarray) -> tuple[float, str, dict[str, float]]:
-    """Normalize supported scoring.py APIs to score/category/component values."""
-    score_function = getattr(scoring, "score_image", None)
-    result: Any
+def load_image_fast(path, raw_debug=None):
+    basename = os.path.basename(path)
+    ext = os.path.splitext(path)[1].lower()
 
-    if callable(score_function):
-        result = score_function(image)
-    else:
-        photo_score_class = getattr(scoring, "PhotoScore", None)
-        if photo_score_class and hasattr(photo_score_class, "from_image"):
-            result = photo_score_class.from_image(image)
-        elif callable(getattr(scoring, "total_score", None)):
-            numeric = float(scoring.total_score(image))
-            classify_function = getattr(scoring, "classify")
-            return numeric, str(classify_function(numeric)), {}
-        else:
-            raise AttributeError(
-                "scoring.py must expose score_image(image), "
-                "PhotoScore.from_image(image), or total_score(image)."
-            )
+    log(f"Loading image: {basename}")
+    log(f"Extension detected: {ext}")
 
-    if is_dataclass(result):
-        payload = asdict(result)
-    elif isinstance(result, Mapping):
-        payload = dict(result)
-    elif isinstance(result, (int, float)):
-        payload = {"score": float(result)}
-    else:
-        payload = {
-            key: getattr(result, key)
-            for key in (
-                "score",
-                "total",
-                "total_score",
-                "category",
-                "classification",
-                "sharpness",
-                "exposure",
-                "contrast",
-                "center_detail",
-            )
-            if hasattr(result, key)
-        }
+    if ext in RAW_EXTENSIONS:
+        if raw_debug is not None:
+            raw_debug["raw_seen"] += 1
 
-    numeric = float(
-        payload.get("score", payload.get("total", payload.get("total_score", 0.0)))
+        if rawpy is None:
+            reason = f"rawpy unavailable: {RAWPY_IMPORT_ERROR}"
+            log(reason)
+
+            if raw_debug is not None:
+                raw_debug["raw_failed"] += 1
+                raw_debug["raw_failures"].append({
+                    "file": basename,
+                    "reason": reason
+                })
+
+            return None
+
+        try:
+            with rawpy.imread(path) as raw:
+                rgb = raw.postprocess(
+                    use_camera_wb=True,
+                    half_size=True,
+                    no_auto_bright=True,
+                    output_bps=8
+                )
+
+            img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            img = resize_for_speed(img)
+
+            log(f"RAW/NEF decoded successfully: {basename}")
+
+            if raw_debug is not None:
+                raw_debug["raw_decoded"] += 1
+
+            return img
+
+        except Exception as e:
+            log(f"RAW/NEF decode failed for {basename}: {e}")
+
+            if raw_debug is not None:
+                raw_debug["raw_failed"] += 1
+                raw_debug["raw_failures"].append({
+                    "file": basename,
+                    "reason": str(e)
+                })
+
+            return None
+
+    img = cv2.imread(path)
+
+    if img is None:
+        log(f"cv2 failed to load image: {basename}")
+        return None
+
+    return resize_for_speed(img)
+
+
+def save_display_jpeg(original_path, img, output_folder):
+    os.makedirs(output_folder, exist_ok=True)
+
+    name = os.path.splitext(os.path.basename(original_path))[0]
+    destination = os.path.join(output_folder, f"{name}.jpg")
+
+    if os.path.exists(destination):
+        stamp = datetime.now().strftime("%H%M%S%f")
+        destination = os.path.join(output_folder, f"{name}_{stamp}.jpg")
+
+    ok = cv2.imwrite(destination, img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+
+    if not ok:
+        raise RuntimeError(f"Failed to write JPEG: {destination}")
+
+    return destination
+
+
+def find_images(folder):
+    files = []
+
+    for root, _, names in os.walk(folder):
+        for name in names:
+            if name.lower().endswith(SUPPORTED_EXTENSIONS):
+                files.append(os.path.join(root, name))
+
+    return sorted(files)
+
+
+def sharpness_score(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return min(cv2.Laplacian(gray, cv2.CV_64F).var() / 8, 100)
+
+
+def exposure_score(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean = gray.mean()
+
+    if 80 <= mean <= 180:
+        return 100
+
+    if mean < 80:
+        return max(0, mean / 80 * 100)
+
+    return max(0, (255 - mean) / 75 * 100)
+
+
+def contrast_score(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return min(gray.std() * 2, 100)
+
+
+def center_detail_score(img):
+    h, w = img.shape[:2]
+    center = img[int(h * .18):int(h * .82), int(w * .18):int(w * .82)]
+
+    return min(
+        (contrast_score(center) * .75) + (contrast_score(img) * .25),
+        100
     )
 
-    category = payload.get("category", payload.get("classification"))
-    if not category:
-        classify_function = getattr(scoring, "classify", None)
-        category = classify_function(numeric) if callable(classify_function) else (
-            "Best" if numeric >= 70 else "Keep" if numeric >= 38 else "Reject"
+
+def total_score(img):
+    return max(0, min(
+        sharpness_score(img) * .50 +
+        exposure_score(img) * .15 +
+        contrast_score(img) * .15 +
+        center_detail_score(img) * .20,
+        100
+    ))
+
+
+def classify(score):
+    if score >= 70:
+        return "Best"
+
+    if score >= 38:
+        return "Keep"
+
+    return "Reject"
+
+
+def average_hash(img, hash_size=8):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (hash_size, hash_size), interpolation=cv2.INTER_AREA)
+    return (small > small.mean()).flatten()
+
+
+def hamming_distance(a, b):
+    return sum(x != y for x, y in zip(a, b))
+
+
+def init_ocr():
+    global ocr_reader
+
+    if easyocr is None:
+        log("easyocr is not available.")
+        return None
+
+    if ocr_reader is None:
+        gpu_enabled = False
+
+        try:
+            import torch
+            gpu_enabled = torch.cuda.is_available()
+        except Exception:
+            gpu_enabled = False
+
+        log(f"Initializing EasyOCR. GPU={gpu_enabled}")
+        ocr_reader = easyocr.Reader(["en"], gpu=gpu_enabled)
+
+    return ocr_reader
+
+
+def jersey_crops(img):
+    h, w = img.shape[:2]
+
+    crops = [
+        ("full", img),
+        ("full_center", img[int(h*.05):int(h*.95), int(w*.08):int(w*.92)]),
+        ("torso_center", img[int(h*.15):int(h*.88), int(w*.15):int(w*.85)]),
+        ("chest_center", img[int(h*.18):int(h*.70), int(w*.22):int(w*.78)]),
+        ("upper_wide", img[int(h*.05):int(h*.76), int(w*.05):int(w*.95)]),
+        ("middle_wide", img[int(h*.20):int(h*.82), int(w*.05):int(w*.95)]),
+        ("lower_torso", img[int(h*.32):int(h*.95), int(w*.15):int(w*.85)]),
+        ("left_body", img[int(h*.08):int(h*.90), int(w*.00):int(w*.62)]),
+        ("right_body", img[int(h*.08):int(h*.90), int(w*.38):int(w*1.00)]),
+        ("center_tall", img[int(h*.00):int(h*1.00), int(w*.25):int(w*.75)]),
+        ("center_square", img[int(h*.18):int(h*.82), int(w*.20):int(w*.80)]),
+    ]
+
+    good = []
+
+    for name, crop in crops:
+        if crop is None:
+            continue
+
+        ch, cw = crop.shape[:2]
+
+        if ch >= 40 and cw >= 40:
+            good.append((name, crop))
+
+    return good
+
+
+def preprocess_for_ocr(crop):
+    versions = []
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    versions.append(("gray", gray))
+
+    eq = cv2.equalizeHist(gray)
+    versions.append(("equalized", eq))
+
+    blur = cv2.GaussianBlur(eq, (3, 3), 0)
+
+    adaptive = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        8
+    )
+
+    versions.append(("adaptive", adaptive))
+    versions.append(("adaptive_inv", cv2.bitwise_not(adaptive)))
+
+    _, otsu = cv2.threshold(
+        blur,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    versions.append(("otsu", otsu))
+    versions.append(("otsu_inv", cv2.bitwise_not(otsu)))
+
+    high_contrast = cv2.convertScaleAbs(gray, alpha=1.8, beta=10)
+    versions.append(("high_contrast", high_contrast))
+
+    upscaled = []
+
+    for name, v in versions:
+        h, w = v.shape[:2]
+
+        if h < 900 and w < 900:
+            upscaled.append((
+                name + "_2x",
+                cv2.resize(v, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            ))
+
+        upscaled.append((name, v))
+
+    return upscaled
+
+
+def clean_ocr_digits(text):
+    text = str(text or "").upper()
+
+    replacements = {
+        "O": "0",
+        "Q": "0",
+        "D": "0",
+        "I": "1",
+        "L": "1",
+        "|": "1",
+        "S": "5",
+        "B": "8",
+        "G": "6",
+        "Z": "2",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return re.sub(r"\D", "", text)
+
+
+def read_jersey_number(img):
+    reader = init_ocr()
+
+    if reader is None:
+        return "", 0.0, "OCR_DISABLED"
+
+    candidates = []
+    raw_hits = []
+
+    try:
+        for crop_name, crop in jersey_crops(img):
+            for version_name, processed in preprocess_for_ocr(crop):
+                found = reader.readtext(
+                    processed,
+                    detail=1,
+                    paragraph=False,
+                    allowlist="0123456789#OQDISBLZG|"
+                )
+
+                for item in found:
+                    text = str(item[1])
+                    conf = float(item[2])
+                    digits = clean_ocr_digits(text)
+
+                    if not digits:
+                        continue
+
+                    if not (1 <= len(digits) <= 3):
+                        continue
+
+                    adjusted_conf = conf
+
+                    if len(digits) <= 2:
+                        adjusted_conf += 0.08
+
+                    if len(digits) == 3 and conf < 0.45:
+                        continue
+
+                    raw_hits.append(
+                        f"{crop_name}/{version_name}:{text}->{digits}:{conf:.2f}"
+                    )
+
+                    candidates.append({
+                        "digits": digits,
+                        "confidence": min(adjusted_conf, 1.0),
+                        "raw_confidence": conf,
+                        "source": f"{crop_name}/{version_name}",
+                        "text": text
+                    })
+
+        if not candidates:
+            return "", 0.0, ""
+
+        candidates = sorted(
+            candidates,
+            key=lambda x: x["confidence"],
+            reverse=True
         )
 
-    components = {}
-    for key in ("sharpness", "exposure", "contrast", "center_detail"):
-        if key in payload:
-            components[key] = round(float(payload[key]), 3)
+        best = candidates[0]
 
-    return numeric, str(category).title(), components
+        return (
+            best["digits"],
+            min(best["confidence"], 1.0),
+            " | ".join(raw_hits)
+        )
 
-
-def _is_duplicate(detector: DuplicateDetector, image: np.ndarray, identifier: str) -> bool:
-    """Support common DuplicateDetector interfaces."""
-    for name in ("is_duplicate", "check"):
-        method = getattr(detector, name, None)
-        if callable(method):
-            try:
-                return bool(method(image, identifier))
-            except TypeError:
-                return bool(method(image))
-
-    add_method = getattr(detector, "add", None)
-    if callable(add_method):
-        try:
-            result = add_method(image, identifier)
-        except TypeError:
-            result = add_method(image)
-
-        if isinstance(result, bool):
-            return result
-        if hasattr(result, "is_duplicate"):
-            return bool(result.is_duplicate)
-
-    raise AttributeError(
-        "DuplicateDetector must expose is_duplicate(), check(), or add()."
-    )
+    except Exception as e:
+        return "", 0.0, f"OCR_ERROR:{e}"
 
 
-def _detect_color_name(image: np.ndarray) -> str:
-    height, width = image.shape[:2]
-    crop = image[
-        int(height * 0.20):int(height * 0.80),
-        int(width * 0.25):int(width * 0.75),
-    ]
-    if crop.size == 0:
-        return "unknown"
+def parse_roster_text(text):
+    """
+    Accepts:
+    12 John Smith
+    John Smith 12
+    #12 John Smith
+    John Smith #12
+    12, John Smith
+    John Smith, 12
+    12 - John Smith
+    John Smith - 12
+    12: John Smith
+    John Smith: 12
+    """
+
+    roster = {}
+
+    for line in str(text or "").splitlines():
+        original = line.strip()
+
+        if not original:
+            continue
+
+        line = original.replace("\t", " ")
+        line = re.sub(r"\s+", " ", line).strip()
+
+        number = ""
+        name = ""
+
+        parts = [
+            p.strip()
+            for p in re.split(r"\s*[,:\-–—|]\s*", line)
+            if p.strip()
+        ]
+
+        if len(parts) >= 2:
+            first = parts[0]
+            last = parts[-1]
+
+            first_num = re.fullmatch(r"#?\d{1,3}", first)
+            last_num = re.fullmatch(r"#?\d{1,3}", last)
+
+            if first_num:
+                number = first.replace("#", "")
+                name = " ".join(parts[1:]).strip()
+
+            elif last_num:
+                number = last.replace("#", "")
+                name = " ".join(parts[:-1]).strip()
+
+        if not number:
+            m = re.match(r"^#?(\d{1,3})\s+(.+)$", line)
+            if m:
+                number = m.group(1)
+                name = m.group(2).strip()
+
+        if not number:
+            m = re.match(r"^(.+?)\s+#?(\d{1,3})$", line)
+            if m:
+                name = m.group(1).strip()
+                number = m.group(2)
+
+        if not number or not name:
+            log(f"Roster line skipped: {original}")
+            continue
+
+        name = re.sub(r"\s+", " ", name).strip(" ,:-–—|")
+        number = number.strip().replace("#", "")
+
+        if not number.isdigit():
+            log(f"Roster line skipped, invalid number: {original}")
+            continue
+
+        roster[number] = name
+
+    log(f"Roster parsed: {len(roster)} players")
+    return roster
+
+
+def roster_match_number(ocr_number, roster, ocr_conf=0.0, ocr_raw=""):
+    if not roster:
+        return "", "no_roster"
+
+    ocr_number = clean_ocr_digits(ocr_number)
+    raw_digits = clean_ocr_digits(ocr_raw)
+
+    if not ocr_number and not raw_digits:
+        return "", "no_ocr_number"
+
+    if ocr_number in roster:
+        return ocr_number, "exact"
+
+    if raw_digits:
+        for number in roster.keys():
+            if number in raw_digits:
+                return number, "raw_contains_roster_number"
+
+    if ocr_number:
+        doubled = ocr_number + ocr_number
+        if doubled in roster:
+            return doubled, "doubled_digit"
+
+    possible = []
+
+    for number in roster.keys():
+        if ocr_number and (ocr_number in number or number in ocr_number):
+            possible.append(number)
+
+    if len(possible) == 1:
+        return possible[0], "partial_unique"
+
+    if len(possible) > 1:
+        possible_sorted = sorted(possible, key=lambda x: abs(len(x) - len(ocr_number)))
+        return possible_sorted[0], "partial_best_guess"
+
+    if len(ocr_number) == 1:
+        ending = [n for n in roster.keys() if n.endswith(ocr_number)]
+        if len(ending) == 1:
+            return ending[0], "single_digit_suffix_unique"
+
+    return "", "no_match"
+
+
+def copy_unique(src, folder):
+    os.makedirs(folder, exist_ok=True)
+
+    dest = os.path.join(folder, os.path.basename(src))
+
+    if os.path.exists(dest):
+        name, ext = os.path.splitext(os.path.basename(src))
+        stamp = datetime.now().strftime("%H%M%S%f")
+        dest = os.path.join(folder, f"{name}_{stamp}{ext}")
+
+    shutil.copy2(src, dest)
+
+    return dest
+
+
+def summarize_results(results):
+    return {
+        "total": len(results),
+        "best": len([r for r in results if r["Category"] == "Best"]),
+        "keep": len([r for r in results if r["Category"] == "Keep"]),
+        "reject": len([r for r in results if r["Category"] == "Reject"]),
+        "duplicates": len([r for r in results if r["Category"] == "Duplicates"]),
+        "matched": len([r for r in results if r["Assigned Player"] != "Unknown"]),
+    }
+
+
+def detect_team_from_color(img, team1_color="", team2_color=""):
+    if not team1_color and not team2_color:
+        return "Team_1"
+
+    h, w = img.shape[:2]
+    crop = img[int(h*.20):int(h*.80), int(w*.25):int(w*.75)]
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    mask = (saturation > 35) & (value > 35)
 
-    mean_s = float(saturation.mean())
-    mean_v = float(value.mean())
-    mean_h = float(hsv[:, :, 0][mask].mean()) if np.any(mask) else 0.0
+    mean_h = hsv[:, :, 0].mean()
+    mean_s = hsv[:, :, 1].mean()
+    mean_v = hsv[:, :, 2].mean()
+
+    detected = "unknown"
 
     if mean_v > 185 and mean_s < 70:
-        return "white"
-    if mean_v < 75:
-        return "black"
-    if mean_s < 55:
-        return "gray"
-    if mean_h < 10 or mean_h >= 165:
-        return "red"
-    if 10 <= mean_h < 20:
-        return "orange"
-    if 20 <= mean_h < 36:
-        return "yellow"
-    if 36 <= mean_h < 88:
-        return "green"
-    if 88 <= mean_h < 132:
-        return "blue"
-    if 132 <= mean_h < 165:
-        return "purple"
-    return "unknown"
+        detected = "white"
+    elif mean_v < 80:
+        detected = "black"
+    elif mean_s < 55 and 80 <= mean_v <= 185:
+        detected = "gray"
+    elif mean_h < 10 or mean_h > 165:
+        detected = "red"
+    elif 90 <= mean_h <= 130:
+        detected = "blue"
+    elif 35 <= mean_h <= 85:
+        detected = "green"
+    elif 18 <= mean_h <= 35:
+        detected = "yellow"
 
+    if team1_color and detected == team1_color:
+        return "Team_1"
 
-def detect_team_from_color(
-    image: np.ndarray,
-    team1_color: str = "",
-    team2_color: str = "",
-) -> str:
-    """Return Team_1 or Team_2 using a conservative torso-color comparison."""
-    color = _detect_color_name(image)
-    team1 = str(team1_color or "").strip().lower()
-    team2 = str(team2_color or "").strip().lower()
-
-    if team2 and color == team2 and color != team1:
+    if team2_color and detected == team2_color:
         return "Team_2"
+
     return "Team_1"
 
 
-def _normalize_job_config(value: str | Mapping[str, Any] | None) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        config = dict(value)
-    else:
-        config = {
-            "mode": "single",
-            "team1": "Team",
-            "team1_color": "",
-            "roster1": str(value or ""),
-            "team2": "Opponent",
-            "team2_color": "",
-            "roster2": "",
-        }
+def build_job_config(roster_text):
+    if isinstance(roster_text, dict):
+        return roster_text
 
-    mode = str(config.get("mode", "single")).strip().lower()
-    config["mode"] = "two_team" if mode in {"two_team", "two-team", "two", "2"} else "single"
-    config.setdefault("team1", "Team")
-    config.setdefault("team2", "Opponent")
-    config.setdefault("team1_color", "")
-    config.setdefault("team2_color", "")
-    config.setdefault("roster1", "")
-    config.setdefault("roster2", "")
-    config.setdefault("ocr_min_confidence", 0.25)
-    config.setdefault("best_of_tournament_limit", 75)
-    config.setdefault("duplicate_threshold", 3)
-    return config
+    return {
+        "mode": "single",
+        "team1": "Team",
+        "team1_color": "",
+        "roster1": roster_text,
+        "team2": "Opponent",
+        "team2_color": "",
+        "roster2": ""
+    }
 
 
-def _create_output_folders(
-    output_dir: Path,
-    mode: str,
-    team_names: tuple[str, str],
-) -> None:
-    base_folders = (
+def process_mobile_job(input_dir, output_dir, roster_text="", progress_callback=None):
+    log("=" * 60)
+    log("Starting process_mobile_job.")
+    log(f"rawpy_available={RAWPY_AVAILABLE}")
+    log(f"rawpy_version={RAWPY_VERSION}")
+
+    raw_debug = {
+        "rawpy_available": RAWPY_AVAILABLE,
+        "rawpy_version": RAWPY_VERSION,
+        "rawpy_import_error": RAWPY_IMPORT_ERROR,
+        "raw_seen": 0,
+        "raw_decoded": 0,
+        "raw_failed": 0,
+        "raw_failures": [],
+    }
+
+    job_config = build_job_config(roster_text)
+
+    mode = job_config.get("mode", "single")
+
+    team1_name = safe_name(job_config.get("team1", "Team_1"))
+    team2_name = safe_name(job_config.get("team2", "Team_2"))
+
+    team1_color = job_config.get("team1_color", "")
+    team2_color = job_config.get("team2_color", "")
+
+    roster1 = parse_roster_text(job_config.get("roster1", ""))
+    roster2 = parse_roster_text(job_config.get("roster2", ""))
+
+    hashes = []
+    results = []
+
+    base_folders = [
         "Originals",
         "Best",
         "Keep",
         "Reject",
         "Duplicates",
         "BestOfTournament",
+        "Players",
         "Players/Unknown",
         "Favorites",
         "Reports",
-    )
-    for folder in base_folders:
-        (output_dir / folder).mkdir(parents=True, exist_ok=True)
-
-    if mode == "two_team":
-        for team in team_names:
-            for folder in ("Best", "Keep", "Reject", "Duplicates", "Players/Unknown"):
-                (output_dir / "Teams" / team / folder).mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-
-def _relative(path: str | Path | None, root: Path) -> str:
-    if not path:
-        return ""
-    try:
-        return Path(path).resolve().relative_to(root.resolve()).as_posix()
-    except Exception:
-        return str(path)
-
-
-def _make_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    counts = {
-        "total": len(rows),
-        "best": 0,
-        "keep": 0,
-        "reject": 0,
-        "duplicates": 0,
-        "matched": 0,
-        "unknown": 0,
-        "errors": 0,
-    }
-
-    for row in rows:
-        category = str(row["Category"]).lower()
-        if category == "best":
-            counts["best"] += 1
-        elif category == "keep":
-            counts["keep"] += 1
-        elif category == "reject":
-            counts["reject"] += 1
-        elif category == "duplicates":
-            counts["duplicates"] += 1
-
-        if row["Assigned Player"] == "Unknown":
-            counts["unknown"] += 1
-        else:
-            counts["matched"] += 1
-
-        if row.get("Error"):
-            counts["errors"] += 1
-
-    return counts
-
-
-def _write_reports(
-    output_dir: Path,
-    rows: list[dict[str, Any]],
-    summary: dict[str, Any],
-    job_config: Mapping[str, Any],
-) -> None:
-    reports = output_dir / "Reports"
-    reports.mkdir(parents=True, exist_ok=True)
-
-    fieldnames = [
-        "Original File",
-        "Category",
-        "Score",
-        "Sharpness",
-        "Exposure",
-        "Contrast",
-        "Center Detail",
-        "Duplicate",
-        "OCR Number",
-        "OCR Confidence",
-        "OCR Raw",
-        "Assigned Player",
-        "Assigned Team",
-        "Detected Color",
-        "Sorted Path",
-        "Player Path",
-        "Error",
     ]
 
-    with (reports / "diamondvision_report.csv").open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    for folder in base_folders:
+        os.makedirs(os.path.join(output_dir, folder), exist_ok=True)
 
-    metadata_images = []
-    for index, row in enumerate(rows, start=1):
-        ocr_confidence = float(row.get("OCR Confidence") or 0.0)
-        score = float(row.get("Score") or 0.0)
-        assigned = row.get("Assigned Player") or "Unknown"
-        category = row.get("Category") or ""
+    if mode == "two_team":
+        team_folders = [
+            f"Teams/{team1_name}/Players/Unknown",
+            f"Teams/{team1_name}/Best",
+            f"Teams/{team1_name}/Keep",
+            f"Teams/{team1_name}/Reject",
+            f"Teams/{team2_name}/Players/Unknown",
+            f"Teams/{team2_name}/Best",
+            f"Teams/{team2_name}/Keep",
+            f"Teams/{team2_name}/Reject",
+        ]
 
-        metadata_images.append(
-            {
-                "id": index,
-                "filename": Path(row.get("Sorted Path") or row["Original File"]).name,
-                "player": assigned,
-                "team": row.get("Assigned Team") or "Unknown",
-                "category": category,
-                "score": score,
-                "ocr": row.get("OCR Number") or "",
-                "ocr_confidence": round(ocr_confidence * 100, 1),
-                "ocr_raw": row.get("OCR Raw") or "",
-                "duplicate": row.get("Duplicate") == "Yes",
-                "favorite": False,
-                "needs_review": (
-                    assigned == "Unknown"
-                    or ocr_confidence < 0.50
-                    or category == "Reject"
-                    or bool(row.get("Error"))
-                ),
-                "ai_confidence": int(
-                    max(0, min(100, round(ocr_confidence * 65 + score * 0.35)))
-                ),
-                "original_path": row.get("Original File") or "",
-                "sorted_path": row.get("Sorted Path") or "",
-                "player_path": row.get("Player Path") or "",
-                "error": row.get("Error") or "",
-            }
-        )
+        for folder in team_folders:
+            os.makedirs(os.path.join(output_dir, folder), exist_ok=True)
 
-    metadata = {
-        "worker_schema": "3.0",
-        "summary": summary,
-        "job_config": {
-            key: value
-            for key, value in job_config.items()
-            if key not in {"dropbox_access_token", "dropbox_refresh_token"}
-        },
-        "images": metadata_images,
-    }
+    files = find_images(input_dir)
+    total = len(files)
 
-    with (reports / "metadata.json").open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2, ensure_ascii=False)
-
-
-def process_mobile_job(
-    input_dir: str | os.PathLike[str],
-    output_dir: str | os.PathLike[str],
-    roster_text: str | Mapping[str, Any] | None = "",
-    progress_callback: ProgressCallback | None = None,
-) -> dict[str, Any]:
-    """Process one extracted DiamondVision photo job."""
-    input_path = Path(input_dir)
-    output_path = Path(output_dir)
-    config = _normalize_job_config(roster_text)
-
-    if not input_path.is_dir():
-        raise FileNotFoundError(f"Input directory does not exist: {input_path}")
-
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    team1_name = safe_name(config["team1"])
-    team2_name = safe_name(config["team2"])
-    mode = config["mode"]
-    roster1 = parse_roster_text(str(config.get("roster1", "")))
-    roster2 = parse_roster_text(str(config.get("roster2", "")))
-
-    _create_output_folders(output_path, mode, (team1_name, team2_name))
-
-    try:
-        detector = DuplicateDetector(
-            threshold=int(config.get("duplicate_threshold", 3))
-        )
-    except TypeError:
-        detector = DuplicateDetector()
-
-    images = list(find_images(str(input_path)))
-    rows: list[dict[str, Any]] = []
-    total = len(images)
+    log(f"Found {total} supported image(s).")
 
     if progress_callback:
-        progress_callback(0, total, "Starting DiamondVision Worker 3.0")
+        progress_callback(0, total, "Starting DiamondVision...")
 
-    for index, source in enumerate(images, start=1):
-        source_path = Path(source)
-        basename = source_path.name
+    for index, file in enumerate(files, start=1):
+        basename = os.path.basename(file)
+
+        log("-" * 60)
+        log(f"Processing {index}/{total}: {basename}")
 
         if progress_callback:
             progress_callback(index - 1, total, f"Loading {basename}")
 
-        original_copy = ""
-        try:
-            original_copy = copy_unique(
-                str(source_path),
-                str(output_path / "Originals"),
-            )
+        original_path = copy_unique(file, os.path.join(output_dir, "Originals"))
+        img = load_image_fast(file, raw_debug=raw_debug)
 
-            image = _load_image(str(source_path))
-            if image is None:
-                raise ValueError("Image decoder returned no image.")
+        if img is None:
+            results.append({
+                "Original File": original_path,
+                "Category": "Reject",
+                "Score": 0,
+                "Duplicate": "No",
+                "OCR Number": "",
+                "OCR Confidence": 0,
+                "OCR Raw": "",
+                "OCR Match Method": "decode_failed",
+                "Assigned Player": "Unknown",
+                "Assigned Team": "Unknown",
+                "Sorted Path": "",
+                "Player Path": ""
+            })
 
-            team_name = team1_name
-            active_roster = roster1
-            if mode == "two_team" and detect_team_from_color(
-                image,
-                str(config.get("team1_color", "")),
-                str(config.get("team2_color", "")),
-            ) == "Team_2":
-                team_name = team2_name
+            if progress_callback:
+                progress_callback(index, total, f"Rejected unreadable file: {basename}")
+
+            continue
+
+        assigned_team_name = team1_name
+        active_roster = roster1
+
+        if mode == "two_team":
+            assigned_team_key = detect_team_from_color(img, team1_color, team2_color)
+
+            if assigned_team_key == "Team_2":
+                assigned_team_name = team2_name
                 active_roster = roster2
 
-            detected_color = _detect_color_name(image)
-            duplicate = _is_duplicate(detector, image, str(source_path))
+        img_hash = average_hash(img)
+        duplicate = any(hamming_distance(img_hash, h) <= 3 for h in hashes)
 
-            if duplicate:
-                category = "Duplicates"
-                sorted_path = save_display_jpeg(
-                    str(source_path),
-                    image,
-                    str(output_path / "Duplicates"),
-                )
-                if mode == "two_team":
-                    save_display_jpeg(
-                        str(source_path),
-                        image,
-                        str(output_path / "Teams" / team_name / "Duplicates"),
-                    )
-
-                row = {
-                    "Original File": _relative(original_copy, output_path),
-                    "Category": category,
-                    "Score": 0.0,
-                    "Sharpness": 0.0,
-                    "Exposure": 0.0,
-                    "Contrast": 0.0,
-                    "Center Detail": 0.0,
-                    "Duplicate": "Yes",
-                    "OCR Number": "",
-                    "OCR Confidence": 0.0,
-                    "OCR Raw": "",
-                    "Assigned Player": "Unknown",
-                    "Assigned Team": team_name,
-                    "Detected Color": detected_color,
-                    "Sorted Path": _relative(sorted_path, output_path),
-                    "Player Path": "",
-                    "Error": "",
-                }
-                rows.append(row)
-
-                if progress_callback:
-                    progress_callback(index, total, f"Duplicate: {basename}")
-                continue
-
-            score, category, components = _score_image(image)
-            if category not in {"Best", "Keep", "Reject"}:
-                category = "Keep"
-
-            sorted_path = save_display_jpeg(
-                str(source_path),
-                image,
-                str(output_path / category),
+        if duplicate:
+            display_path = save_display_jpeg(
+                file,
+                img,
+                os.path.join(output_dir, "Duplicates")
             )
+
+            results.append({
+                "Original File": original_path,
+                "Category": "Duplicates",
+                "Score": 0,
+                "Duplicate": "Yes",
+                "OCR Number": "",
+                "OCR Confidence": 0,
+                "OCR Raw": "",
+                "OCR Match Method": "duplicate_skipped",
+                "Assigned Player": "Unknown",
+                "Assigned Team": assigned_team_name,
+                "Sorted Path": display_path,
+                "Player Path": ""
+            })
+
+            if progress_callback:
+                progress_callback(index, total, f"Duplicate: {basename}")
+
+            continue
+
+        hashes.append(img_hash)
+
+        score = total_score(img)
+        category = classify(score)
+
+        display_path = save_display_jpeg(
+            file,
+            img,
+            os.path.join(output_dir, category)
+        )
+
+        if mode == "two_team":
+            save_display_jpeg(
+                file,
+                img,
+                os.path.join(output_dir, "Teams", assigned_team_name, category)
+            )
+
+        ocr_number = ""
+        ocr_conf = 0
+        ocr_raw = ""
+        match_method = ""
+        assigned = "Unknown"
+        player_path = ""
+
+        ocr_number, ocr_conf, ocr_raw = read_jersey_number(img)
+        matched_number, match_method = roster_match_number(
+            ocr_number,
+            active_roster,
+            ocr_conf=ocr_conf,
+            ocr_raw=ocr_raw
+        )
+
+        if matched_number:
+            ocr_number = matched_number
+            assigned = active_roster[matched_number]
+
+        if category in ("Best", "Keep") or assigned != "Unknown":
+            if assigned == "Unknown":
+                player_folder = os.path.join(output_dir, "Players", "Unknown")
+            else:
+                player_folder = os.path.join(
+                    output_dir,
+                    "Players",
+                    safe_name(f"{ocr_number}_{assigned}")
+                )
+
+            player_path = save_display_jpeg(file, img, player_folder)
 
             if mode == "two_team":
-                save_display_jpeg(
-                    str(source_path),
-                    image,
-                    str(output_path / "Teams" / team_name / category),
-                )
-
-            ocr_number = ""
-            ocr_confidence = 0.0
-            ocr_raw = ""
-            assigned_player = "Unknown"
-            player_path = ""
-
-            if category in {"Best", "Keep"}:
-                ocr_number, ocr_confidence, ocr_raw = read_jersey_number(
-                    image,
-                    active_roster,
-                )
-                matched_number = match_roster_number(ocr_number, active_roster)
-
-                if (
-                    matched_number
-                    and ocr_confidence >= float(config["ocr_min_confidence"])
-                ):
-                    ocr_number = matched_number
-                    assigned_player = active_roster[matched_number]
-
-                player_folder_name = (
-                    "Unknown"
-                    if assigned_player == "Unknown"
-                    else safe_name(f"{ocr_number}_{assigned_player}")
-                )
-                player_path = save_display_jpeg(
-                    str(source_path),
-                    image,
-                    str(output_path / "Players" / player_folder_name),
-                )
-
-                if mode == "two_team":
-                    save_display_jpeg(
-                        str(source_path),
-                        image,
-                        str(
-                            output_path
-                            / "Teams"
-                            / team_name
-                            / "Players"
-                            / player_folder_name
-                        ),
+                if assigned == "Unknown":
+                    team_player_folder = os.path.join(
+                        output_dir,
+                        "Teams",
+                        assigned_team_name,
+                        "Players",
+                        "Unknown"
+                    )
+                else:
+                    team_player_folder = os.path.join(
+                        output_dir,
+                        "Teams",
+                        assigned_team_name,
+                        "Players",
+                        safe_name(f"{ocr_number}_{assigned}")
                     )
 
-            rows.append(
-                {
-                    "Original File": _relative(original_copy, output_path),
-                    "Category": category,
-                    "Score": round(score, 3),
-                    "Sharpness": components.get("sharpness", ""),
-                    "Exposure": components.get("exposure", ""),
-                    "Contrast": components.get("contrast", ""),
-                    "Center Detail": components.get("center_detail", ""),
-                    "Duplicate": "No",
-                    "OCR Number": ocr_number,
-                    "OCR Confidence": round(ocr_confidence, 4),
-                    "OCR Raw": ocr_raw,
-                    "Assigned Player": assigned_player,
-                    "Assigned Team": team_name,
-                    "Detected Color": detected_color,
-                    "Sorted Path": _relative(sorted_path, output_path),
-                    "Player Path": _relative(player_path, output_path),
-                    "Error": "",
-                }
-            )
+                save_display_jpeg(file, img, team_player_folder)
 
-            if progress_callback:
-                progress_callback(index, total, f"{category}: {basename}")
+        results.append({
+            "Original File": original_path,
+            "Category": category,
+            "Score": round(score, 2),
+            "Duplicate": "No",
+            "OCR Number": ocr_number,
+            "OCR Confidence": round(ocr_conf, 3),
+            "OCR Raw": ocr_raw,
+            "OCR Match Method": match_method,
+            "Assigned Player": assigned,
+            "Assigned Team": assigned_team_name,
+            "Sorted Path": display_path,
+            "Player Path": player_path
+        })
 
-        except Exception as error:
-            LOGGER.exception("Failed to process %s.", source_path)
+        log(
+            f"Finished {basename}: category={category}, score={round(score, 2)}, "
+            f"ocr={ocr_number}, conf={round(ocr_conf, 3)}, "
+            f"match={match_method}, player={assigned}"
+        )
 
-            rows.append(
-                {
-                    "Original File": _relative(original_copy or source_path, output_path),
-                    "Category": "Reject",
-                    "Score": 0.0,
-                    "Sharpness": "",
-                    "Exposure": "",
-                    "Contrast": "",
-                    "Center Detail": "",
-                    "Duplicate": "No",
-                    "OCR Number": "",
-                    "OCR Confidence": 0.0,
-                    "OCR Raw": "",
-                    "Assigned Player": "Unknown",
-                    "Assigned Team": "Unknown",
-                    "Detected Color": "unknown",
-                    "Sorted Path": "",
-                    "Player Path": "",
-                    "Error": f"{type(error).__name__}: {error}",
-                }
-            )
+        if progress_callback:
+            progress_callback(index, total, f"{category}: {basename}")
 
-            if progress_callback:
-                progress_callback(index, total, f"Error: {basename}")
-
-    eligible = sorted(
-        (
-            row
-            for row in rows
-            if row["Category"] in {"Best", "Keep"}
-            and row["Duplicate"] == "No"
-            and row["Sorted Path"]
-        ),
-        key=lambda row: float(row["Score"]),
-        reverse=True,
+    best = sorted(
+        [
+            r for r in results
+            if r["Category"] in ("Best", "Keep")
+            and r["Duplicate"] == "No"
+            and r.get("Sorted Path")
+        ],
+        key=lambda x: x["Score"],
+        reverse=True
     )
 
-    limit = max(0, int(config.get("best_of_tournament_limit", 75)))
-    for row in eligible[:limit]:
+    for r in best[:75]:
         try:
-            copy_unique(
-                str(output_path / row["Sorted Path"]),
-                str(output_path / "BestOfTournament"),
-            )
-        except Exception:
-            LOGGER.warning(
-                "Could not copy BestOfTournament image %s.",
-                row["Sorted Path"],
-                exc_info=True,
-            )
+            copy_unique(r["Sorted Path"], os.path.join(output_dir, "BestOfTournament"))
+        except Exception as e:
+            log(f"BestOfTournament copy failed: {e}")
 
-    summary = _make_summary(rows)
-    _write_reports(output_path, rows, summary, config)
+    report = os.path.join(output_dir, "Reports", "diamondvision_report.csv")
+
+    with open(report, "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "Original File",
+            "Category",
+            "Score",
+            "Duplicate",
+            "OCR Number",
+            "OCR Confidence",
+            "OCR Raw",
+            "OCR Match Method",
+            "Assigned Player",
+            "Assigned Team",
+            "Sorted Path",
+            "Player Path"
+        ]
+
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(results)
+
+    metadata_images = []
+
+    for r in results:
+        filename = os.path.basename(r.get("Sorted Path") or r.get("Original File") or "")
+
+        ocr_conf = float(r.get("OCR Confidence") or 0)
+        score = float(r.get("Score") or 0)
+        duplicate = r.get("Duplicate") == "Yes"
+        category = r.get("Category", "")
+        assigned_player = r.get("Assigned Player", "Unknown") or "Unknown"
+
+        needs_review = (
+            assigned_player == "Unknown"
+            or ocr_conf < 0.35
+            or category == "Reject"
+        )
+
+        ai_confidence = int(max(
+            0,
+            min(100, round(((ocr_conf * 100) * 0.65) + (score * 0.35)))
+        ))
+
+        metadata_images.append({
+            "id": os.path.splitext(filename)[0],
+            "filename": filename,
+            "player": assigned_player,
+            "team": r.get("Assigned Team", "Unknown"),
+            "category": category,
+            "score": score,
+            "ocr": r.get("OCR Number", ""),
+            "ocr_confidence": round(ocr_conf * 100, 1),
+            "ocr_raw": r.get("OCR Raw", ""),
+            "ocr_match_method": r.get("OCR Match Method", ""),
+            "duplicate": duplicate,
+            "favorite": False,
+            "needs_review": needs_review,
+            "ai_confidence": ai_confidence,
+            "original_path": r.get("Original File", ""),
+            "sorted_path": r.get("Sorted Path", ""),
+            "player_path": r.get("Player Path", "")
+        })
+
+    summary = summarize_results(results)
+
+    metadata = {
+        "version": "4.1",
+        "processor_version": PROCESSOR_VERSION,
+        "summary": summary,
+        "raw_support": raw_debug,
+        "images": metadata_images
+    }
+
+    metadata_path = os.path.join(output_dir, "Reports", "metadata.json")
+
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     if progress_callback:
         progress_callback(total, total, "Complete")
 
-    LOGGER.info("Processing complete: %s", summary)
+    log("=" * 60)
+    log("process_mobile_job complete.")
+    log(f"Summary: {summary}")
+    log(f"RAW support: {raw_debug}")
+    log("=" * 60)
+
     return summary
